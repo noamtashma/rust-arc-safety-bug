@@ -28,8 +28,8 @@ use core::pin::Pin;
 use core::ptr::{self, NonNull};
 #[cfg(not(no_global_oom_handling))]
 use core::slice::from_raw_parts_mut;
-use core::sync::atomic;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use core::sync::atomic::{self, AtomicU32};
 
 #[cfg(not(no_global_oom_handling))]
 use crate::alloc::handle_alloc_error;
@@ -47,11 +47,19 @@ use crate::vec::Vec;
 #[cfg(test)]
 mod tests;
 
+/// The exploit itself
+#[cfg(test)]
+mod exploit;
+
+/// The internal counter type (originally usize).
+type Counter = u32;
+type ACounter = AtomicU32;
+
 /// A soft limit on the amount of references that may be made to an `Arc`.
 ///
 /// Going above this limit will abort your program (although not
 /// necessarily) at _exactly_ `MAX_REFCOUNT + 1` references.
-const MAX_REFCOUNT: usize = (isize::MAX) as usize;
+const MAX_REFCOUNT: Counter = (i32::MAX) as Counter;
 
 #[cfg(not(sanitize = "thread"))]
 macro_rules! acquire {
@@ -323,12 +331,12 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Weak<T> {
 // inner types.
 #[repr(C)]
 struct ArcInner<T: ?Sized> {
-    strong: atomic::AtomicUsize,
+    strong: ACounter,
 
     // the value usize::MAX acts as a sentinel for temporarily "locking" the
     // ability to upgrade weak pointers or downgrade strong ones; this is used
     // to avoid races in `make_mut` and `get_mut`.
-    weak: atomic::AtomicUsize,
+    weak: ACounter,
 
     data: T,
 }
@@ -352,11 +360,8 @@ impl<T> Arc<T> {
     pub fn new(data: T) -> Arc<T> {
         // Start the weak pointer count as 1 which is the weak pointer that's
         // held by all the strong pointers (kinda), see std/rc.rs for more info
-        let x: Box<_> = Box::new(ArcInner {
-            strong: atomic::AtomicUsize::new(1),
-            weak: atomic::AtomicUsize::new(1),
-            data,
-        });
+        let x: Box<_> =
+            Box::new(ArcInner { strong: ACounter::new(1), weak: ACounter::new(1), data });
         unsafe { Self::from_inner(Box::leak(x).into()) }
     }
 
@@ -421,8 +426,8 @@ impl<T> Arc<T> {
         // Construct the inner in the "uninitialized" state with a single
         // weak reference.
         let uninit_ptr: NonNull<_> = Box::leak(Box::new(ArcInner {
-            strong: atomic::AtomicUsize::new(0),
-            weak: atomic::AtomicUsize::new(1),
+            strong: ACounter::new(0),
+            weak: ACounter::new(1),
             data: mem::MaybeUninit::<T>::uninit(),
         }))
         .into();
@@ -565,11 +570,8 @@ impl<T> Arc<T> {
     pub fn try_new(data: T) -> Result<Arc<T>, AllocError> {
         // Start the weak pointer count as 1 which is the weak pointer that's
         // held by all the strong pointers (kinda), see std/rc.rs for more info
-        let x: Box<_> = Box::try_new(ArcInner {
-            strong: atomic::AtomicUsize::new(1),
-            weak: atomic::AtomicUsize::new(1),
-            data,
-        })?;
+        let x: Box<_> =
+            Box::try_new(ArcInner { strong: ACounter::new(1), weak: ACounter::new(1), data })?;
         unsafe { Ok(Self::from_inner(Box::leak(x).into())) }
     }
 
@@ -944,14 +946,14 @@ impl<T: ?Sized> Arc<T> {
 
         loop {
             // check if the weak counter is currently "locked"; if so, spin.
-            if cur == usize::MAX {
+            if cur == Counter::MAX {
                 hint::spin_loop();
                 cur = this.inner().weak.load(Relaxed);
                 continue;
             }
 
             // NOTE: this code currently ignores the possibility of overflow
-            // into usize::MAX; in general both Rc and Arc need to be adjusted
+            // into Counter::MAX; in general both Rc and Arc need to be adjusted
             // to deal with overflow.
 
             // Unlike with Clone(), we need this to be an Acquire read to
@@ -991,11 +993,15 @@ impl<T: ?Sized> Arc<T> {
     #[inline]
     #[must_use]
     #[stable(feature = "arc_counts", since = "1.15.0")]
-    pub fn weak_count(this: &Self) -> usize {
+    pub fn weak_count(this: &Self) -> Counter {
         let cnt = this.inner().weak.load(Acquire);
         // If the weak count is currently locked, the value of the
         // count was 0 just before taking the lock.
-        if cnt == usize::MAX { 0 } else { cnt - 1 }
+        if cnt == Counter::MAX {
+            0
+        } else {
+            cnt - 1
+        }
     }
 
     /// Gets the number of strong (`Arc`) pointers to this allocation.
@@ -1021,7 +1027,7 @@ impl<T: ?Sized> Arc<T> {
     #[inline]
     #[must_use]
     #[stable(feature = "arc_counts", since = "1.15.0")]
-    pub fn strong_count(this: &Self) -> usize {
+    pub fn strong_count(this: &Self) -> Counter {
         this.inner().strong.load(Acquire)
     }
 
@@ -1189,8 +1195,8 @@ impl<T: ?Sized> Arc<T> {
         debug_assert_eq!(unsafe { Layout::for_value(&*inner) }, layout);
 
         unsafe {
-            ptr::write(&mut (*inner).strong, atomic::AtomicUsize::new(1));
-            ptr::write(&mut (*inner).weak, atomic::AtomicUsize::new(1));
+            ptr::write(&mut (*inner).strong, ACounter::new(1));
+            ptr::write(&mut (*inner).weak, ACounter::new(1));
         }
 
         Ok(inner)
@@ -1371,7 +1377,7 @@ impl<T: ?Sized> Clone for Arc<T> {
         // This check is not 100% water-proof: we error when the refcount grows beyond `isize::MAX`.
         // But we do that check *after* having done the increment, so there is a chance here that
         // the worst already happened and we actually do overflow the `usize` counter. However, that
-        // requires the counter to grow from `isize::MAX` to `usize::MAX` between the increment
+        // requires the counter to grow from `isize::MAX` to `Counter::MAX` between the increment
         // above and the `abort` below, which seems exceedingly unlikely.
         if old_size > MAX_REFCOUNT {
             abort();
@@ -1476,7 +1482,7 @@ impl<T: Clone> Arc<T> {
             // invalidate the other weak refs.
 
             // Note that it is not possible for the read of `weak` to yield
-            // usize::MAX (i.e., locked), since the weak count can only be
+            // Counter::MAX (i.e., locked), since the weak count can only be
             // locked by a thread with a strong reference.
 
             // Materialize our own implicit weak pointer, so that it can clean
@@ -1624,7 +1630,7 @@ impl<T: ?Sized> Arc<T> {
         // writes to `strong` (in particular in `Weak::upgrade`) prior to decrements
         // of the `weak` count (via `Weak::drop`, which uses release).  If the upgraded
         // weak ref was never dropped, the CAS here will fail so we do not care to synchronize.
-        if self.inner().weak.compare_exchange(1, usize::MAX, Acquire, Relaxed).is_ok() {
+        if self.inner().weak.compare_exchange(1, Counter::MAX, Acquire, Relaxed).is_ok() {
             // This needs to be an `Acquire` to synchronize with the decrement of the `strong`
             // counter in `drop` -- the only access that happens when any but the last reference
             // is being dropped.
@@ -1814,8 +1820,8 @@ impl<T> Weak<T> {
 /// Helper type to allow accessing the reference counts without
 /// making any assertions about the data field.
 struct WeakInner<'a> {
-    weak: &'a atomic::AtomicUsize,
-    strong: &'a atomic::AtomicUsize,
+    weak: &'a ACounter,
+    strong: &'a ACounter,
 }
 
 impl<T: ?Sized> Weak<T> {
@@ -2016,8 +2022,12 @@ impl<T: ?Sized> Weak<T> {
     /// If `self` was created using [`Weak::new`], this will return 0.
     #[must_use]
     #[stable(feature = "weak_counts", since = "1.41.0")]
-    pub fn strong_count(&self) -> usize {
-        if let Some(inner) = self.inner() { inner.strong.load(Acquire) } else { 0 }
+    pub fn strong_count(&self) -> Counter {
+        if let Some(inner) = self.inner() {
+            inner.strong.load(Acquire)
+        } else {
+            0
+        }
     }
 
     /// Gets an approximation of the number of `Weak` pointers pointing to this
@@ -2033,7 +2043,7 @@ impl<T: ?Sized> Weak<T> {
     /// `Weak`s pointing to the same allocation.
     #[must_use]
     #[stable(feature = "weak_counts", since = "1.41.0")]
-    pub fn weak_count(&self) -> usize {
+    pub fn weak_count(&self) -> Counter {
         self.inner()
             .map(|inner| {
                 let weak = inner.weak.load(Acquire);
